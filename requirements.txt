@@ -1,0 +1,5 @@
+numpy>=1.26
+pandas>=2.2
+requests>=2.31
+mplfinance>=0.12.10b0
+matplotlib>=3.9

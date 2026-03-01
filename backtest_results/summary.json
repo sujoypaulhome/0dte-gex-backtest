@@ -1,0 +1,78 @@
+{
+  "total_trading_days": 50,
+  "no_signal_days": 3,
+  "total_trades": 47,
+  "wins": 43,
+  "losses": 4,
+  "win_rate": 0.9149,
+  "total_pnl": 279.0,
+  "avg_pnl": 5.94,
+  "profit_factor": 1.2579,
+  "max_win": 150.0,
+  "max_loss": -374.0,
+  "by_symbol": {
+    "QQQ": {
+      "trades": 10,
+      "wins": 10,
+      "losses": 0,
+      "win_rate": 1.0,
+      "total_pnl": 344.0,
+      "avg_credit": 34.4,
+      "real_prices": 7
+    },
+    "IWM": {
+      "trades": 10,
+      "wins": 10,
+      "losses": 0,
+      "win_rate": 1.0,
+      "total_pnl": 94.0,
+      "avg_credit": 9.4,
+      "real_prices": 8
+    },
+    "TSLA": {
+      "trades": 5,
+      "wins": 5,
+      "losses": 0,
+      "win_rate": 1.0,
+      "total_pnl": 113.0,
+      "avg_credit": 22.6,
+      "real_prices": 5
+    },
+    "NVDA": {
+      "trades": 6,
+      "wins": 6,
+      "losses": 0,
+      "win_rate": 1.0,
+      "total_pnl": 375.0,
+      "avg_credit": 62.5,
+      "real_prices": 4
+    },
+    "AMZN": {
+      "trades": 5,
+      "wins": 5,
+      "losses": 0,
+      "win_rate": 1.0,
+      "total_pnl": 174.0,
+      "avg_credit": 37.0,
+      "real_prices": 5
+    },
+    "META": {
+      "trades": 6,
+      "wins": 4,
+      "losses": 2,
+      "win_rate": 0.6667,
+      "total_pnl": -450.0,
+      "avg_credit": 54.17,
+      "real_prices": 6
+    },
+    "GOOGL": {
+      "trades": 5,
+      "wins": 3,
+      "losses": 2,
+      "win_rate": 0.6,
+      "total_pnl": -371.0,
+      "avg_credit": 60.6,
+      "real_prices": 5
+    }
+  }
+}
