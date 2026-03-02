@@ -28,14 +28,17 @@ import requests
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from dotenv import load_dotenv
 
 # ============================================================================
 # Section 0: Config
 # ============================================================================
 
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 API_KEY = os.environ.get("POLYGON_API_KEY", "")
 if not API_KEY:
-    sys.exit("ERROR: Set POLYGON_API_KEY environment variable. Get a free key at https://polygon.io")
+    sys.exit("ERROR: Set POLYGON_API_KEY in .env file or environment. Get a free key at https://polygon.io")
 BASE = "https://api.polygon.io"
 
 SNAPSHOT_PAGE_LIMIT = 250
@@ -81,7 +84,7 @@ def _get(url: str, params: Dict = None) -> Dict:
         params = {}
     params["apiKey"] = API_KEY
     last = None
-    for attempt in range(3):
+    for attempt in range(5):
         r = requests.get(url, params=params, timeout=30)
         last = r
         if r.status_code == 200:
@@ -89,7 +92,12 @@ def _get(url: str, params: Dict = None) -> Dict:
                 return r.json()
             except Exception:
                 pass
-        time.sleep(0.6 * (attempt + 1))
+        if r.status_code == 429:
+            wait = 15 * (attempt + 1)
+            print(f"    Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+        else:
+            time.sleep(1)
     raise RuntimeError(f"Polygon GET failed {last.status_code}: {last.text[:200]}")
 
 
@@ -98,7 +106,7 @@ def _get_next(next_url: str) -> Dict:
         sep = "&" if "?" in next_url else "?"
         next_url = f"{next_url}{sep}apiKey={API_KEY}"
     last = None
-    for attempt in range(3):
+    for attempt in range(5):
         r = requests.get(next_url, timeout=30)
         last = r
         if r.status_code == 200:
@@ -106,7 +114,12 @@ def _get_next(next_url: str) -> Dict:
                 return r.json()
             except Exception:
                 pass
-        time.sleep(0.6 * (attempt + 1))
+        if r.status_code == 429:
+            wait = 15 * (attempt + 1)
+            print(f"    Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        time.sleep(1)
     raise RuntimeError(f"Polygon NEXT failed {last.status_code}: {last.text[:200]}")
 
 

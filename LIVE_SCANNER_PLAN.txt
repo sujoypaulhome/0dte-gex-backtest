@@ -1,0 +1,600 @@
+LIVE GEX WALL SCANNER - PRODUCTION PLAN
+========================================
+Date: 2026-03-01
+Location: C:\Users\sujoy\gex-wall-backtest\
+
+GOAL
+----
+A standalone Python script (gex_live_scanner.py) that runs each trading morning
+and alerts you with exact credit spread trades to place manually in TradeStation.
+No automated order execution. Alert only.
+
+================================================================================
+FILES IN THIS PROJECT
+================================================================================
+
+  C:\Users\sujoy\gex-wall-backtest\
+  ├── gex_wall_rejection_backtest.py   # Historical backtest (existing, working)
+  ├── gex_live_scanner.py              # <-- TO BUILD: live morning scanner
+  ├── test_barchart_scrape.py          # Barchart API test (working, confirmed)
+  ├── .env                             # API keys (gitignored)
+  ├── .gitignore
+  ├── requirements.txt
+  ├── README.md
+  ├── LIVE_SCANNER_PLAN.txt            # This file
+  └── backtest_results/                # Charts, CSV, JSON from backtest
+
+  .env contents:
+    POLYGON_API_KEY=<polygon key>
+    BARCHART_USER=sujoykpaul2012@gmail.com
+    BARCHART_PASS=<barchart password>
+    NTFY_TOPIC=skp-gamma-alerts
+
+================================================================================
+PHASE 1: BARCHART IV RANK PRE-SCAN
+================================================================================
+
+Purpose: Find high-IV-rank tickers to add to the daily scan list.
+Timing: Anytime before 9:35 ET. Can be night before or 20 min before open.
+         IV rank doesn't change intraday in any meaningful way.
+
+Source URL (for reference):
+  https://www.barchart.com/options/iv-rank-percentile/high?viewName=main
+  &orderBy=optionsImpliedVolatilityRank1y&orderDir=desc
+
+PROVEN APPROACH (tested 2026-03-01, returns HTTP 200 with correct metadata):
+  No Selenium needed. Pure Python requests with login cookies + XSRF token.
+  Returns 0 rows on weekends (expected — no market data). Will return full
+  data on weekdays.
+
+  Working test file: test_barchart_scrape.py
+
+STEP-BY-STEP CODE FLOW:
+
+  import os, re, urllib.parse, requests
+  from dotenv import load_dotenv
+
+  load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+  USER = os.environ.get("BARCHART_USER")
+  PASS = os.environ.get("BARCHART_PASS")
+
+  session = requests.Session()
+  session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+
+  # 1) GET login page → extract Laravel CSRF _token from hidden input
+  r = session.get("https://www.barchart.com/login")
+  csrf = re.search(r'name="_token"\s+value="([^"]+)"', r.text).group(1)
+  # Cookies received: laravel_token, XSRF-TOKEN, laravel_session, market
+
+  # 2) POST login form
+  r = session.post("https://www.barchart.com/login", data={
+      "_token": csrf, "email": USER, "password": PASS, "remember": "on",
+  }, headers={
+      "Referer": "https://www.barchart.com/login",
+      "Origin": "https://www.barchart.com",
+      "Content-Type": "application/x-www-form-urlencoded",
+  }, allow_redirects=True)
+  # Success: redirects to https://www.barchart.com/
+  # Failure: stays on /login, body contains "incorrect"
+  # New cookie: remember_web_3dc7a913ef5fd4b890ecabe3487085573e16cf82
+
+  # 3) GET target page to refresh XSRF-TOKEN cookie
+  session.get("https://www.barchart.com/options/iv-rank-percentile/high")
+
+  # 4) URL-decode the XSRF-TOKEN cookie and set as header
+  #    (Laravel base64-encodes it; URL-encoding adds %3D etc.)
+  xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN"))
+  session.headers.update({
+      "X-XSRF-TOKEN": xsrf,
+      "Accept": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+      "Referer": "https://www.barchart.com/options/iv-rank-percentile/high",
+  })
+
+  # 5) Call the internal Barchart API
+  r = session.get("https://www.barchart.com/proxies/core-api/v1/options/get",
+      params={
+          "list": "ivRankHigh",
+          "fields": "symbol,symbolName,optionsImpliedVolatilityRank1y,"
+                    "optionsImpliedVolatilityPercentile1y,"
+                    "ivHv30DayDiff,optionsTotalVolume,tradeTime",
+          "orderBy": "optionsImpliedVolatilityRank1y",
+          "orderDir": "desc",
+          "meta": "field.shortName,field.type",
+          "hasOptions": "true",
+          "limit": "50",
+      })
+
+  # 6) Parse JSON response
+  data = r.json()
+  # Structure: {"count": N, "total": N, "data": [...], "meta": {...}}
+  # Each row: data[i]["raw"]["symbol"]
+  #           data[i]["raw"]["optionsImpliedVolatilityRank1y"]   (float, 0-100)
+  #           data[i]["raw"]["optionsImpliedVolatilityPercentile1y"]
+  #           data[i]["raw"]["optionsTotalVolume"]
+  #           data[i]["raw"]["symbolName"]
+
+FILTERING LOGIC:
+  - Take top 50 tickers by IV rank from Barchart
+  - Remove any already in core list (QQQ, IWM, TSLA, NVDA, AMZN)
+  - Remove any without 0DTE today:
+      DAILY_0DTE = {"SPY", "QQQ", "IWM"}  → Mon-Fri
+      MWF_0DTE = {"TSLA","NVDA","AMZN","META","AAPL","MSFT","AVGO","GOOGL","IBIT"}
+      Check: today.weekday() in (0,2,4) for MWF, <5 for daily
+      All others: Friday only (weekday==4)
+  - Remove anything with optionsTotalVolume < 1000 (too illiquid)
+  - Take top 3-5 remaining tickers
+  - Add to scan list alongside core 5
+
+================================================================================
+PHASE 2: GEX WALL DETECTION (run once at ~9:30 ET)
+================================================================================
+
+Purpose: For each ticker in the scan list, find today's CALL_WALL and PUT_WALL.
+Timing: Run once at startup. Walls don't change intraday.
+
+STEP-BY-STEP:
+
+  For each symbol in scan_list:
+
+  1) FIND NEAREST 0DTE EXPIRATION:
+     GET https://api.polygon.io/v3/reference/options/contracts
+       ?underlying_ticker={SYMBOL}&expired=false&order=asc
+       &sort=expiration_date&limit=1000&apiKey={KEY}
+     Paginate via "next_url" field until all expirations collected.
+     Pick the expiration with 0 DTE (same as today).
+     If no exact 0DTE, pick nearest within 0-7 DTE.
+
+  2) FETCH OPTION CHAIN SNAPSHOT:
+     GET https://api.polygon.io/v3/snapshot/options/{SYMBOL}
+       ?expiration_date={YYYY-MM-DD}&order=asc&sort=strike_price
+       &limit=250&apiKey={KEY}
+     Paginate via "next_url".
+     For each contract in results:
+       details.contract_type → "call" or "put"
+       details.strike_price  → float
+       open_interest          → float
+       greeks.gamma           → float (not used in scanner, but available)
+
+  3) COMPUTE WALLS:
+     CALL_WALL = strike with highest open_interest among type=="call"
+     PUT_WALL  = strike with highest open_interest among type=="put"
+
+  4) GET UNDERLYING SPOT PRICE:
+     Try in order:
+       a) GET /v3/trades/{SYMBOL}?limit=1&sort=timestamp&order=desc
+          → results[0].price
+       b) GET /v2/snapshot/locale/us/markets/stocks/tickers/{SYMBOL}
+          → ticker.lastTrade.p or ticker.day.c or ticker.prevDay.c
+       c) GET /v2/aggs/ticker/{SYMBOL}/prev
+          → results[0].c
+
+  Result per ticker: {call_wall: float, put_wall: float, spot: float, expiry: str}
+
+================================================================================
+PHASE 3: FETCH 5-MIN BARS + COMPUTE ATR (run once at startup)
+================================================================================
+
+Purpose: Seed ATR(14) so it's ready before the scan window opens at 9:35.
+Timing: At startup, before the polling loop begins.
+
+  For each symbol:
+
+  1) FETCH 5-MIN BARS:
+     Need today + 2 prior trading days for ATR baseline.
+     start_date = today - 5 calendar days (covers weekends)
+     end_date = today
+
+     GET https://api.polygon.io/v2/aggs/ticker/{SYMBOL}/range/5/minute
+       /{start_date}/{end_date}?adjusted=true&sort=asc&limit=50000&apiKey={KEY}
+     Paginate via "next_url".
+
+     Parse results:
+       df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+       df["t"] = df["t"].dt.tz_convert("America/New_York")
+       Columns: open, high, low, close, volume (indexed by timestamp)
+
+  2) COMPUTE ATR(14):
+     True Range for each bar:
+       TR = max(High - Low, |High - prevClose|, |Low - prevClose|)
+     ATR = rolling mean of TR over 14 bars (min_periods=14)
+
+     With 2 prior days of 5-min bars (~78 bars/day × 2 = ~156 bars),
+     ATR(14) will be well-seeded before 9:35 today.
+
+  Store: bars_5min[symbol] = DataFrame, atr[symbol] = Series
+
+================================================================================
+PHASE 4: MOMENTUM SPIKE POLLING LOOP (9:35 - 10:30 ET)
+================================================================================
+
+Purpose: Detect ATR spikes in real-time(ish) as 5-min candles complete.
+Timing: Poll every 60 seconds. Each cycle re-fetches today's 5-min bars.
+
+  LOOP (every 60 seconds):
+    now = current time in ET
+    if now > 10:30 ET: exit loop
+
+    For each symbol in scan_list (that hasn't already fired):
+
+      1) RE-FETCH today's 5-min bars (to get latest completed candle):
+         GET /v2/aggs/ticker/{SYMBOL}/range/5/minute/{today}/{today}
+           ?adjusted=true&sort=asc&limit=5000&apiKey={KEY}
+         Append to existing bars_5min[symbol] (deduplicate by timestamp)
+
+      2) RE-COMPUTE ATR(14) on full bar history (prior days + today)
+
+      3) SCAN for spike in today's bars between 9:35-10:30 ET:
+         For each 5-min candle in scan window:
+           candle_range = High - Low
+           current_atr = ATR(14) at this timestamp
+           if current_atr is NaN or <= 0: skip
+
+           if candle_range > 2.0 * current_atr:
+             *** SPIKE DETECTED ***
+
+             Determine direction:
+               candle close > candle open → BULLISH → CALL_WALL_PUSH
+               candle close < candle open → BEARISH → PUT_WALL_PUSH
+               candle close == candle open (doji) →
+                 (high - close) <= (close - low) → CALL_WALL_PUSH
+                 else → PUT_WALL_PUSH
+
+             FIRST spike wins — mark this symbol as "fired", skip future polls
+
+      4) If spike detected → go to PHASE 5 (alert)
+
+  RATE LIMIT STRATEGY:
+    Polygon free tier = 5 calls/min.
+    With 7-10 tickers, each poll cycle needs 1 call per ticker (5-min bars).
+    10 calls/cycle at 60s intervals = 10 calls/min → exceeds limit.
+    Solution: stagger tickers. Poll 2-3 tickers per cycle, rotate.
+    Or: increase poll interval to 90s. Or: batch multiple tickers in
+    fewer cycles. The 429 retry logic (15s backoff) handles bursts.
+
+================================================================================
+PHASE 5: ALERT OUTPUT
+================================================================================
+
+Purpose: Show exact trade details for manual entry in TradeStation.
+
+WHEN A SIGNAL FIRES:
+
+  1) LOOK UP REAL OPTION PRICES (for credit estimate):
+     Build OCC ticker for short and long legs:
+       Format: O:{SYMBOL}{YYMMDD}{C or P}{strike×1000, 8-digit zero-padded}
+       Example: O:TSLA260302C00425000 (TSLA $425 call expiring 2026-03-02)
+
+     Fetch 5-min option bars:
+       GET /v2/aggs/ticker/{OCC}/range/5/minute/{today}/{today}
+         ?adjusted=true&sort=asc&limit=5000&apiKey={KEY}
+     Find candle with timestamp <= signal_time, use its close price.
+     Do this for both legs. Credit = (short_price - long_price) × 100.
+     If no data: estimate credit = $0.30 × spread_width × 100.
+
+  2) PRINT ALERT BOX:
+     ┌──────────────────────────────────────────────────────┐
+     │  ** SIGNAL: TSLA BEAR CALL SPREAD **                 │
+     │                                                      │
+     │  Time:     09:40 ET                                  │
+     │  Ticker:   TSLA                                      │
+     │  Spot:     $417.40                                   │
+     │  IV Rank:  78% (from Barchart pre-scan)              │
+     │                                                      │
+     │  Call Wall: $425  (highest call OI)                   │
+     │  Put Wall:  $390  (highest put OI)                    │
+     │                                                      │
+     │  TRADE TO PLACE IN TRADESTATION:                     │
+     │    Sell  1x  TSLA 03/02 $425 Call                    │
+     │    Buy   1x  TSLA 03/02 $430 Call                    │
+     │    Expiry: 0DTE (2026-03-02)                         │
+     │    Width: $5.00                                      │
+     │    Target Credit: ~$0.66/share ($66/contract)        │
+     │    Max Loss: $434/contract                           │
+     │                                                      │
+     │  TRIGGER DETAILS:                                    │
+     │    ATR(14):      $1.23                               │
+     │    Candle Range: $2.87                               │
+     │    Spike Ratio:  2.33x ATR                           │
+     │    Direction:    Bullish candle → sell at call wall   │
+     └──────────────────────────────────────────────────────┘
+
+  3) NOTIFICATIONS (all via ntfy.sh to topic from .env NTFY_TOPIC):
+
+     NOTIFICATION #1: IV RANK PRE-SCAN (sent once at startup, before 9:35)
+     Purpose: Show you today's scan universe so you know what's being watched.
+
+       def send_iv_rank_notification(scan_list, iv_data, topic):
+           """Send top 20 IV ranked tickers as a simple list."""
+           lines = ["Today's top IV Rank tickers:"]
+           lines.append("")
+           lines.append(f"{'#':<3} {'Sym':<7} {'IV Rank':>8} {'IV Pctl':>8}")
+           lines.append("-" * 30)
+           for i, row in enumerate(iv_data[:20], 1):
+               marker = " <--" if row["symbol"] in scan_list else ""
+               lines.append(f"{i:<3} {row['symbol']:<7} {row['iv_rank']:>7.1f}% {row['iv_pctl']:>7.1f}%{marker}")
+           lines.append("")
+           lines.append(f"Scanning: {', '.join(scan_list)}")
+
+           requests.post(f"https://ntfy.sh/{topic}",
+               headers={"Title": "GEX Scanner - IV Rank Top 20",
+                        "Priority": "default", "Tags": "bar_chart"},
+               data="\n".join(lines))
+
+       Example output on phone:
+         GEX Scanner - IV Rank Top 20
+         Today's top IV Rank tickers:
+
+         #   Sym     IV Rank  IV Pctl
+         ------------------------------
+         1   MSTR      94.2%    91.0%
+         2   SMCI      88.7%    85.3%
+         3   TSLA      78.5%    82.1% <--
+         4   NVDA      71.2%    69.8% <--
+         5   GME       68.9%    72.4%
+         ...
+         Scanning: QQQ, IWM, TSLA, NVDA, AMZN, MSTR, SMCI
+
+     NOTIFICATION #2: TRADE SIGNAL (sent each time a spike fires)
+     Purpose: Exact trade details for manual entry in TradeStation.
+
+       def send_trade_notification(signal, walls, prices, iv_rank, topic):
+           """Send full trade alert with GEX walls and prices."""
+           # Determine trade legs
+           if signal.signal_type == "CALL_WALL_PUSH":
+               spread_name = "BEAR CALL SPREAD"
+               short_type = "Call"
+               short_strike = walls["call_wall"]
+               long_strike = short_strike + spread_width
+               next_wall_label = "Next Call"
+               next_wall_val = walls.get("next_call_wall", "N/A")
+           else:
+               spread_name = "BULL PUT SPREAD"
+               short_type = "Put"
+               short_strike = walls["put_wall"]
+               long_strike = short_strike - spread_width
+               next_wall_label = "Next Put"
+               next_wall_val = walls.get("next_put_wall", "N/A")
+
+           body = f"""TRADE TO PLACE:
+  Sell 1x {signal.symbol} {expiry_str} ${short_strike:.0f} {short_type}
+  Buy  1x {signal.symbol} {expiry_str} ${long_strike:.0f} {short_type}
+  Expiry: 0DTE | Width: ${spread_width:.2f}
+  Credit: ~${credit_per_share:.2f}/share (${credit_total:.0f}/contract)
+  Max Loss: ${max_loss:.0f}/contract
+
+PRICE:
+  Open:    ${day_open:.2f}
+  Current: ${spot:.2f}
+
+GEX WALLS:
+  Call Wall: ${walls['call_wall']:.0f}{' (target)' if signal.signal_type == 'CALL_WALL_PUSH' else ''}
+  Next Call: ${next_call:.0f}
+  Put Wall:  ${walls['put_wall']:.0f}{' (target)' if signal.signal_type == 'PUT_WALL_PUSH' else ''}
+  Next Put:  ${next_put:.0f}
+
+IV Rank: {iv_rank:.0f}%
+
+TRIGGER:
+  {signal_time} ET | {'Bullish' if signal.signal_type == 'CALL_WALL_PUSH' else 'Bearish'} spike
+  ATR: ${atr:.2f} | Range: ${candle_range:.2f} ({spike_ratio:.1f}x)"""
+
+           requests.post(f"https://ntfy.sh/{topic}",
+               headers={"Title": f"{signal.symbol} {spread_name}",
+                        "Priority": "high", "Tags": "rotating_light"},
+               data=body)
+
+     FINDING "NEXT" WALLS:
+       When computing GEX walls, also track the 2nd-highest OI call and put:
+         calls_sorted = calls.sort_values("oi", ascending=False)
+         call_wall      = calls_sorted.iloc[0]["strike"]  # highest OI
+         next_call_wall = calls_sorted.iloc[1]["strike"]  # 2nd highest OI
+         (same for puts)
+       Store in walls dict: {call_wall, next_call_wall, put_wall, next_put_wall, spot}
+
+     SOUND — also play on Windows when trade signal fires:
+       import winsound
+       winsound.Beep(1000, 500)  # 1000Hz for 500ms, built-in, no deps
+
+     d) LOG — append to signals_log.csv:
+        date, time, symbol, signal_type, wall_strike, long_strike,
+        spread_width, estimated_credit, spot, iv_rank, atr, candle_range
+
+  SPREAD WIDTHS (from backtest):
+    QQQ: $2      IWM: $1
+    TSLA: $5     NVDA: $5     AMZN: $5
+    Dynamic tickers from IV scan: default $5
+
+================================================================================
+PHASE 6: END OF DAY
+================================================================================
+
+After 10:30 ET (scan window closes):
+  - Print summary: how many tickers scanned, how many signals fired, how many
+    no-signal
+  - If signals_log.csv exists, append today's entries
+  - Exit cleanly
+
+================================================================================
+POLYGON API REFERENCE (all endpoints used)
+================================================================================
+
+Base URL: https://api.polygon.io
+All endpoints require: ?apiKey={POLYGON_API_KEY}
+
+1. Option contracts list (find expirations):
+   GET /v3/reference/options/contracts
+     ?underlying_ticker={SYM}&expired=false&order=asc&sort=expiration_date&limit=1000
+   Paginate: response.next_url
+
+2. Option chain snapshot (OI for GEX walls):
+   GET /v3/snapshot/options/{SYM}
+     ?expiration_date={YYYY-MM-DD}&order=asc&sort=strike_price&limit=250
+   Paginate: response.next_url
+   Each result: details.contract_type, details.strike_price, open_interest, greeks.gamma
+
+3. Underlying spot price:
+   GET /v3/trades/{SYM}?limit=1&sort=timestamp&order=desc
+     → results[0].price
+   Fallback: GET /v2/snapshot/locale/us/markets/stocks/tickers/{SYM}
+     → ticker.lastTrade.p or ticker.day.c or ticker.prevDay.c
+   Fallback: GET /v2/aggs/ticker/{SYM}/prev
+     → results[0].c
+
+4. 5-min stock bars (for ATR):
+   GET /v2/aggs/ticker/{SYM}/range/5/minute/{from}/{to}
+     ?adjusted=true&sort=asc&limit=50000
+   Paginate: response.next_url
+
+5. 5-min option bars (for credit estimate):
+   GET /v2/aggs/ticker/{OCC}/range/5/minute/{date}/{date}
+     ?adjusted=true&sort=asc&limit=5000
+   OCC format: O:{SYMBOL}{YYMMDD}{C/P}{strike×1000 zero-padded to 8 digits}
+   Example: O:TSLA260302C00425000
+
+Rate limits: Free tier = 5 calls/min.
+Retry logic: 5 attempts, 429 → wait 15s × attempt_number (15/30/45/60/75s).
+Other errors: wait 1s between retries.
+
+================================================================================
+BARCHART API REFERENCE (IV rank endpoint)
+================================================================================
+
+Base URL: https://www.barchart.com
+Requires: authenticated session (login cookies + XSRF token)
+
+1. Login page:
+   GET /login → extract _token from: <input name="_token" value="...">
+   POST /login → body: _token, email, password, remember=on
+   Headers: Content-Type: application/x-www-form-urlencoded,
+            Referer: https://www.barchart.com/login
+   Success: redirect to https://www.barchart.com/
+
+2. XSRF token refresh:
+   GET /options/iv-rank-percentile/high → refreshes XSRF-TOKEN cookie
+   URL-decode the cookie value before using as header
+
+3. IV rank API:
+   GET /proxies/core-api/v1/options/get
+   Headers: X-XSRF-TOKEN: {decoded_xsrf},
+            Accept: application/json,
+            X-Requested-With: XMLHttpRequest,
+            Referer: https://www.barchart.com/options/iv-rank-percentile/high
+   Params:
+     list=ivRankHigh
+     fields=symbol,symbolName,optionsImpliedVolatilityRank1y,
+            optionsImpliedVolatilityPercentile1y,ivHv30DayDiff,
+            optionsTotalVolume,tradeTime
+     orderBy=optionsImpliedVolatilityRank1y
+     orderDir=desc
+     meta=field.shortName,field.type
+     hasOptions=true
+     limit=50
+
+   Response: {"count": N, "total": N, "data": [...], "meta": {...}}
+   Each row:  data[i]["raw"]["symbol"]                              → "TSLA"
+              data[i]["raw"]["symbolName"]                           → "Tesla Inc"
+              data[i]["raw"]["optionsImpliedVolatilityRank1y"]       → 78.5
+              data[i]["raw"]["optionsImpliedVolatilityPercentile1y"] → 82.3
+              data[i]["raw"]["optionsTotalVolume"]                   → 1234567
+
+================================================================================
+TICKER UNIVERSE
+================================================================================
+
+CORE (always scanned, profitable in backtest):
+  QQQ   — ETF,   daily 0DTE (Mon-Fri), spread width $2, avg credit $34.40
+  IWM   — ETF,   daily 0DTE (Mon-Fri), spread width $1, avg credit  $9.40
+  TSLA  — Stock, MWF 0DTE,             spread width $5, avg credit $22.60
+  NVDA  — Stock, MWF 0DTE,             spread width $5, avg credit $62.50
+  AMZN  — Stock, MWF 0DTE,             spread width $5, avg credit $37.00
+
+DROPPED (unprofitable in backtest — walls too close to spot, breached often):
+  META  — 4/6 wins, -$450 total, walls only $5-10 from spot
+  GOOGL — 3/5 wins, -$371 total, same wall-breach problem
+
+DYNAMIC ADDITIONS (from Barchart IV rank scan):
+  Top 3-5 high IV rank tickers with 0DTE today + volume > 1000
+  Default spread width: $5
+  Must pass 0DTE filter:
+    DAILY_0DTE (Mon-Fri): SPY, QQQ, IWM
+    MWF_0DTE (Mon/Wed/Fri): TSLA, NVDA, AMZN, META, AAPL, MSFT, AVGO, GOOGL, IBIT
+    All others: Friday only
+
+================================================================================
+BACKTEST RESULTS (for reference / expected performance)
+================================================================================
+
+10-day backtest, Feb 13-27 2026, 47 trades total, real option prices from Polygon:
+
+  Ticker  Trades  Wins  Losses  Win Rate  Total P&L  Avg Credit  Real Prices
+  ------  ------  ----  ------  --------  ---------  ----------  -----------
+  QQQ        10    10       0    100.0%     +$344      $34.40      7 of 10
+  IWM        10    10       0    100.0%      +$94       $9.40      8 of 10
+  TSLA        5     5       0    100.0%     +$113      $22.60      5 of  5
+  NVDA        6     6       0    100.0%     +$375      $62.50      4 of  6
+  AMZN        5     5       0    100.0%     +$174      $37.00      5 of  5
+  META        6     4       2     66.7%     -$450      $54.17      6 of  6
+  GOOGL       5     3       2     60.0%     -$371      $60.60      5 of  5
+
+  OVERALL: 91.5% win rate, +$279 total P&L, profit factor 1.26
+  40 of 47 trades used real option prices (85%)
+
+================================================================================
+ARCHITECTURE SUMMARY
+================================================================================
+
+Single file: gex_live_scanner.py
+
+  main()
+    ├── barchart_login(session)           # Returns authenticated requests.Session
+    ├── fetch_iv_rank(session)            # Returns list of {symbol, iv_rank, ...}
+    ├── build_scan_list(iv_rank_data)     # Core 5 + top dynamic tickers
+    ├── for each symbol in scan_list:
+    │     ├── get_current_gex_levels()    # Call wall, put wall, spot
+    │     └── fetch_5min_bars()           # Today + 2 prior days
+    ├── compute_5min_atr() for each       # ATR(14) seeded with prior days
+    ├── POLLING LOOP (9:35-10:30 ET, every 60s):
+    │     ├── for each unfired symbol:
+    │     │     ├── refresh_5min_bars()   # Get latest candle
+    │     │     ├── recompute_atr()
+    │     │     └── check_for_spike()     # candle_range > 2x ATR(14)
+    │     └── if spike:
+    │           ├── fetch_option_prices() # Real credit estimate
+    │           └── print_alert()         # Exact trade details
+    └── print_summary()                   # End of day recap
+
+Dependencies: numpy, pandas, requests, python-dotenv, winotify
+              (mplfinance/matplotlib NOT needed — no charts in scanner)
+              ntfy.sh needs no pip install — just a requests.post() call
+              winsound is built-in to Python on Windows
+
+================================================================================
+OPEN QUESTIONS
+================================================================================
+
+1. Desktop notifications: add winsound.Beep (built-in) for sound? Or plyer
+   for Windows toast notifications? Or just console output for now?
+2. Should signals_log.csv track live performance alongside backtest results?
+3. Rate limiting with 8-10 tickers: stagger polls (2-3 tickers per 60s cycle)
+   or increase interval to 90-120s? The 429 retry handles it but adds latency.
+4. Should dynamic tickers from IV scan have a minimum IV rank threshold
+   (e.g., IV rank > 50%) or just take whatever the top N are?
+
+================================================================================
+RESOLVED
+================================================================================
+
+- IV rank source: Barchart internal API. Confirmed working 2026-03-01.
+  Pure requests — no Selenium, no headless browser, no extra dependencies.
+  Login → XSRF token → JSON API. Returns 0 rows on weekends (expected).
+  Test file: test_barchart_scrape.py
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Verify Barchart IV rank data returns on Monday (weekday market hours)
+2. Build gex_live_scanner.py using the architecture above
+3. Test during live market hours (9:30-10:30 ET)
+4. Iterate on alert format based on what's useful for manual TradeStation entry
