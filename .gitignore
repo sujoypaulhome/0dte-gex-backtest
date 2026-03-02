@@ -3,5 +3,6 @@ __pycache__/
 .env
 venv/
 signals_log.csv
+scanner.log
 login_failed.png
 page_debug.html

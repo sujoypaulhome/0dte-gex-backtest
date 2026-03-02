@@ -19,6 +19,7 @@ import re
 import csv
 import time
 import json
+import logging
 import urllib.parse
 import winsound
 from datetime import date, datetime, timedelta
@@ -43,6 +44,25 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "skp-gamma-alerts")
 
 if not POLYGON_KEY:
     sys.exit("ERROR: Set POLYGON_API_KEY in .env")
+
+# File logging — all print output goes to scanner.log + console
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scanner.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+_log = logging.getLogger("gex_scanner")
+
+# Redirect print → logger so all output goes to both console and file
+_orig_print = print
+def print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    _log.info(msg)
 
 POLYGON_BASE = "https://api.polygon.io"
 ET = ZoneInfo("America/New_York")
