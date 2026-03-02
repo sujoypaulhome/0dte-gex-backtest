@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 venv/
+signals_log.csv
+login_failed.png
+page_debug.html
