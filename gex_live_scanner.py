@@ -175,14 +175,11 @@ def beep():
 # Phase 1: Barchart IV Rank Pre-Scan
 # ============================================================================
 
-def barchart_fetch_iv_rank() -> List[Dict]:
-    """
-    Login to Barchart, fetch top 50 tickers by IV rank (1yr).
-    Returns list of dicts: [{symbol, name, iv_rank, iv_pctl, volume}, ...]
-    """
+def _barchart_session() -> Optional[req.Session]:
+    """Login to Barchart, return authenticated session or None."""
     if not BARCHART_USER or not BARCHART_PASS:
-        print("  Barchart credentials not set, skipping IV scan")
-        return []
+        print("  Barchart credentials not set")
+        return None
 
     session = req.Session()
     session.headers["User-Agent"] = (
@@ -190,20 +187,18 @@ def barchart_fetch_iv_rank() -> List[Dict]:
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # 1) GET login page for CSRF token
     try:
         r = session.get("https://www.barchart.com/login", timeout=15)
     except Exception as e:
         print(f"  Barchart login page failed: {e}")
-        return []
+        return None
 
     match = re.search(r'name="_token"\s+value="([^"]+)"', r.text)
     if not match:
         print("  Could not find CSRF token on Barchart login page")
-        return []
+        return None
     csrf = match.group(1)
 
-    # 2) POST login
     r = session.post("https://www.barchart.com/login", data={
         "_token": csrf, "email": BARCHART_USER,
         "password": BARCHART_PASS, "remember": "on",
@@ -215,16 +210,15 @@ def barchart_fetch_iv_rank() -> List[Dict]:
 
     if "login" in r.url.lower() and "incorrect" in r.text.lower():
         print("  Barchart login failed: bad credentials")
-        return []
+        return None
 
-    # 3) Refresh XSRF token
+    # Refresh XSRF token
     session.get("https://www.barchart.com/options/iv-rank-percentile/high",
                 timeout=15)
-
     xsrf = session.cookies.get("XSRF-TOKEN")
     if not xsrf:
         print("  No XSRF token from Barchart")
-        return []
+        return None
 
     session.headers.update({
         "X-XSRF-TOKEN": urllib.parse.unquote(xsrf),
@@ -232,23 +226,35 @@ def barchart_fetch_iv_rank() -> List[Dict]:
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.barchart.com/options/iv-rank-percentile/high",
     })
+    return session
 
-    # 4) Call internal API
-    r = session.get(
-        "https://www.barchart.com/proxies/core-api/v1/options/get",
-        params={
-            "list": "ivRankHigh",
-            "fields": ("symbol,symbolName,optionsImpliedVolatilityRank1y,"
-                       "optionsImpliedVolatilityPercentile1y,"
-                       "optionsTotalVolume,tradeTime"),
-            "orderBy": "optionsImpliedVolatilityRank1y",
-            "orderDir": "desc",
-            "meta": "field.shortName,field.type",
-            "hasOptions": "true",
-            "limit": "50",
-        },
-        timeout=15,
-    )
+
+def barchart_fetch_iv_rank(symbols: List[str]) -> List[Dict]:
+    """
+    Fetch IV rank for specific symbols via Barchart per-symbol API.
+    Returns list of dicts: [{symbol, name, iv_rank, iv_pctl, volume}, ...]
+    """
+    session = _barchart_session()
+    if session is None:
+        return []
+
+    # Query all symbols in one call (comma-separated)
+    sym_str = ",".join(symbols)
+    try:
+        r = session.get(
+            "https://www.barchart.com/proxies/core-api/v1/quotes/get",
+            params={
+                "symbols": sym_str,
+                "fields": ("symbol,symbolName,optionsImpliedVolatilityRank1y,"
+                           "optionsImpliedVolatilityPercentile1y,"
+                           "optionsWeightedImpliedVolatility,optionsTotalVolume"),
+                "meta": "field.shortName",
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  Barchart API call failed: {e}")
+        return []
 
     if r.status_code != 200:
         print(f"  Barchart API returned {r.status_code}")
@@ -259,15 +265,42 @@ def barchart_fetch_iv_rank() -> List[Dict]:
 
     results = []
     for row in rows:
-        raw = row.get("raw", {})
+        raw = row.get("raw", row)
+        sym = raw.get("symbol") or row.get("symbol", "")
+        if not sym or sym == "N/A":
+            continue
+
+        def parse_pct(val):
+            if val is None or val == "N/A":
+                return 0.0
+            s = str(val).replace("%", "").replace(",", "").strip()
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+
+        def parse_int(val):
+            if val is None or val == "N/A":
+                return 0
+            s = str(val).replace(",", "").strip()
+            try:
+                return int(float(s))
+            except ValueError:
+                return 0
+
         results.append({
-            "symbol": raw.get("symbol", ""),
-            "name": raw.get("symbolName", ""),
-            "iv_rank": float(raw.get("optionsImpliedVolatilityRank1y", 0) or 0),
-            "iv_pctl": float(raw.get("optionsImpliedVolatilityPercentile1y", 0) or 0),
-            "volume": int(raw.get("optionsTotalVolume", 0) or 0),
+            "symbol": sym,
+            "name": raw.get("symbolName") or row.get("symbolName", ""),
+            "iv_rank": parse_pct(raw.get("optionsImpliedVolatilityRank1y")
+                                 or row.get("optionsImpliedVolatilityRank1y")),
+            "iv_pctl": parse_pct(raw.get("optionsImpliedVolatilityPercentile1y")
+                                 or row.get("optionsImpliedVolatilityPercentile1y")),
+            "volume": parse_int(raw.get("optionsTotalVolume")
+                                or row.get("optionsTotalVolume")),
         })
 
+    # Sort by IV rank descending
+    results.sort(key=lambda x: x["iv_rank"], reverse=True)
     return results
 
 
@@ -281,37 +314,11 @@ def has_0dte_today(symbol: str) -> bool:
     return dow == 4  # Friday only
 
 
-def build_scan_list(iv_data: List[Dict]) -> Tuple[List[str], Dict[str, float]]:
-    """
-    Build today's scan list: core tickers + top dynamic from IV rank.
-    Returns (scan_list, iv_rank_map).
-    """
-    core = [t for t in CORE_TICKERS if has_0dte_today(t)]
-    core_set = set(core)
-    iv_rank_map = {}
-
-    # Map IV rank for core tickers
-    for row in iv_data:
-        if row["symbol"] in core_set:
-            iv_rank_map[row["symbol"]] = row["iv_rank"]
-
-    # Find dynamic additions
-    dynamic = []
-    for row in iv_data:
-        sym = row["symbol"]
-        if sym in core_set:
-            continue
-        if not has_0dte_today(sym):
-            continue
-        if row["volume"] < MIN_OPTION_VOLUME:
-            continue
-        dynamic.append(sym)
-        iv_rank_map[sym] = row["iv_rank"]
-        if len(dynamic) >= MAX_DYNAMIC_TICKERS:
-            break
-
-    scan_list = core + dynamic
-    return scan_list, iv_rank_map
+def build_scan_list() -> List[str]:
+    """Build today's scan list: core tickers filtered by 0DTE schedule."""
+    # All candidate tickers (core + MWF)
+    all_tickers = list(DAILY_0DTE | MWF_0DTE)
+    return [t for t in all_tickers if has_0dte_today(t)]
 
 
 def send_iv_rank_notification(scan_list: List[str], iv_data: List[Dict]):
@@ -790,20 +797,27 @@ def main():
 
     today = date.today()
 
-    # ---- Phase 1: Barchart IV rank ----
-    print("\n[Phase 1] Fetching IV rank from Barchart...")
-    iv_data = barchart_fetch_iv_rank()
-    if iv_data:
-        print(f"  Got {len(iv_data)} tickers from Barchart")
-    else:
-        print("  No IV data (weekend or login issue). Using core tickers only.")
-
-    scan_list, iv_rank_map = build_scan_list(iv_data)
+    # ---- Phase 1: Build scan list + Barchart IV rank ----
+    scan_list = build_scan_list()
     print(f"\n  Scan list: {', '.join(scan_list)}")
 
+    if not scan_list:
+        print("  No tickers have 0DTE today. Exiting.")
+        return
+
+    print("\n[Phase 1] Fetching IV rank from Barchart...")
+    iv_data = barchart_fetch_iv_rank(scan_list)
+    iv_rank_map: Dict[str, float] = {}
     if iv_data:
+        print(f"  Got IV data for {len(iv_data)} tickers")
+        for row in iv_data:
+            iv_rank_map[row["symbol"]] = row["iv_rank"]
+            print(f"    {row['symbol']:<6} IV Rank={row['iv_rank']:>6.1f}%  "
+                  f"IV Pctl={row['iv_pctl']:>5.1f}%  Vol={row['volume']:>12,}")
         send_iv_rank_notification(scan_list, iv_data)
         print("  Sent IV rank notification")
+    else:
+        print("  No IV data (weekend or login issue). Continuing without.")
 
     # ---- Phase 2: GEX walls ----
     print(f"\n[Phase 2] Fetching GEX walls...")
