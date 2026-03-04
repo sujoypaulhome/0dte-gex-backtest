@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import requests
 import mplfinance as mpf
+import gex_common
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from dotenv import load_dotenv
@@ -39,7 +40,8 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 API_KEY = os.environ.get("POLYGON_API_KEY", "")
 if not API_KEY:
     sys.exit("ERROR: Set POLYGON_API_KEY in .env file or environment. Get a free key at https://polygon.io")
-BASE = "https://api.polygon.io"
+
+gex_common.init(API_KEY)
 
 SNAPSHOT_PAGE_LIMIT = 250
 
@@ -76,133 +78,8 @@ class BacktestConfig:
 
 
 # ============================================================================
-# Section 1: HTTP Helpers
+# Section 2: Data Fetching (backtest-specific + shared via gex_common)
 # ============================================================================
-
-def _get(url: str, params: Dict = None) -> Dict:
-    if params is None:
-        params = {}
-    params["apiKey"] = API_KEY
-    last = None
-    for attempt in range(5):
-        r = requests.get(url, params=params, timeout=30)
-        last = r
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                pass
-        if r.status_code == 429:
-            wait = 15 * (attempt + 1)
-            print(f"    Rate limited, waiting {wait}s...")
-            time.sleep(wait)
-        else:
-            time.sleep(1)
-    raise RuntimeError(f"Polygon GET failed {last.status_code}: {last.text[:200]}")
-
-
-def _get_next(next_url: str) -> Dict:
-    if "apiKey=" not in next_url:
-        sep = "&" if "?" in next_url else "?"
-        next_url = f"{next_url}{sep}apiKey={API_KEY}"
-    last = None
-    for attempt in range(5):
-        r = requests.get(next_url, timeout=30)
-        last = r
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                pass
-        if r.status_code == 429:
-            wait = 15 * (attempt + 1)
-            print(f"    Rate limited, waiting {wait}s...")
-            time.sleep(wait)
-            continue
-        time.sleep(1)
-    raise RuntimeError(f"Polygon NEXT failed {last.status_code}: {last.text[:200]}")
-
-
-# ============================================================================
-# Section 2: Data Fetching
-# ============================================================================
-
-def get_underlying_price(symbol: str) -> Optional[float]:
-    """Best-effort latest stock/ETF price."""
-    # v3 trades (latest)
-    try:
-        js = _get(f"{BASE}/v3/trades/{symbol}",
-                  {"limit": 1, "sort": "timestamp", "order": "desc"})
-        res = js.get("results") or []
-        if res:
-            px = res[0].get("price") or res[0].get("p")
-            if px is not None and np.isfinite(float(px)):
-                return float(px)
-    except Exception:
-        pass
-    # v2 snapshot
-    try:
-        js = _get(f"{BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
-        tkr = js.get("ticker") or {}
-        p = ((tkr.get("lastTrade") or {}).get("p")
-             or (tkr.get("day") or {}).get("c")
-             or (tkr.get("prevDay") or {}).get("c"))
-        if p is not None and np.isfinite(float(p)):
-            return float(p)
-    except Exception:
-        pass
-    # prev close
-    try:
-        js = _get(f"{BASE}/v2/aggs/ticker/{symbol}/prev")
-        res = js.get("results") or []
-        if res and res[0].get("c") is not None:
-            return float(res[0]["c"])
-    except Exception:
-        pass
-    return None
-
-
-def nearest_expiration(symbol: str, min_dte: int = 0, max_dte: int = 7) -> Optional[str]:
-    """Find the nearest option expiration date within [min_dte, max_dte]."""
-    today = date.today()
-    params = {
-        "underlying_ticker": symbol,
-        "expired": "false",
-        "order": "asc",
-        "sort": "expiration_date",
-        "limit": 1000,
-    }
-    data = _get(f"{BASE}/v3/reference/options/contracts", params)
-
-    exps = set()
-    while True:
-        for it in data.get("results", []) or []:
-            exp = it.get("expiration_date")
-            if exp:
-                exps.add(exp)
-        nxt = data.get("next_url")
-        if not nxt:
-            break
-        data = _get_next(nxt)
-
-    if not exps:
-        return None
-
-    candidates = []
-    for e in sorted(exps):
-        dte = (date.fromisoformat(e) - today).days
-        if min_dte <= dte <= max_dte:
-            candidates.append((dte, e))
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-    # fallback: nearest overall
-    all_sorted = sorted(
-        [(abs((date.fromisoformat(e) - today).days), e) for e in exps],
-        key=lambda x: x[0],
-    )
-    return all_sorted[0][1] if all_sorted else None
-
 
 def fetch_chain_snapshot(symbol: str, expiry: str) -> Tuple[List[Dict], float]:
     """Fetch option snapshots for symbol & expiry. Returns (contracts, spot)."""
@@ -212,8 +89,8 @@ def fetch_chain_snapshot(symbol: str, expiry: str) -> Tuple[List[Dict], float]:
         "sort": "strike_price",
         "limit": SNAPSHOT_PAGE_LIMIT,
     }
-    url = f"{BASE}/v3/snapshot/options/{symbol}"
-    data = _get(url, params)
+    url = f"{gex_common._BASE}/v3/snapshot/options/{symbol}"
+    data = gex_common.poly_get(url, params)
 
     results: List[Dict] = []
 
@@ -236,10 +113,10 @@ def fetch_chain_snapshot(symbol: str, expiry: str) -> Tuple[List[Dict], float]:
 
     parse_batch(data)
     while data.get("next_url"):
-        data = _get_next(data["next_url"])
+        data = gex_common.poly_next(data["next_url"])
         parse_batch(data)
 
-    S = get_underlying_price(symbol)
+    S = gex_common.get_underlying_price(symbol)
     if S is None:
         raise RuntimeError(f"[{symbol}] Could not resolve underlying price.")
     return results, S
@@ -250,7 +127,7 @@ def get_current_gex_levels(symbol: str) -> Dict:
     Get today's CALL_WALL, PUT_WALL, and spot price from live snapshot.
     Returns dict: {call_wall, put_wall, spot}
     """
-    exp = nearest_expiration(symbol, min_dte=0, max_dte=7)
+    exp = gex_common.nearest_expiration(symbol, min_dte=0, max_dte=7)
     if not exp:
         raise RuntimeError(f"[{symbol}] No expiration found.")
     contracts, S = fetch_chain_snapshot(symbol, exp)
@@ -275,8 +152,8 @@ def fetch_daily_bars(symbol: str, calendar_days: int = 120) -> pd.DataFrame:
     """Fetch daily OHLCV bars. Returns DataFrame with date index."""
     end = date.today()
     start = end - timedelta(days=calendar_days)
-    js = _get(
-        f"{BASE}/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}",
+    js = gex_common.poly_get(
+        f"{gex_common._BASE}/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}",
         {"adjusted": "true", "sort": "asc", "limit": 5000},
     )
     arr = js.get("results") or []
@@ -292,52 +169,17 @@ def fetch_daily_bars(symbol: str, calendar_days: int = 120) -> pd.DataFrame:
     return df
 
 
-def fetch_5min_bars(symbol: str, start_date: date,
-                    end_date: date) -> pd.DataFrame:
-    """
-    Fetch 5-min bars over a date range, converted to America/New_York tz.
-    Uses pagination to get all bars.
-    """
-    all_results = []
-    js = _get(
-        f"{BASE}/v2/aggs/ticker/{symbol}/range/5/minute/{start_date}/{end_date}",
-        {"adjusted": "true", "sort": "asc", "limit": 50000},
-    )
-    all_results.extend(js.get("results") or [])
-
-    while js.get("next_url"):
-        js = _get_next(js["next_url"])
-        all_results.extend(js.get("results") or [])
-
-    if not all_results:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_results)
-    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df["t"] = df["t"].dt.tz_convert("America/New_York")
-    df = df.rename(columns={"o": "open", "h": "high", "l": "low",
-                             "c": "close", "v": "volume"})
-    df = df.set_index("t")
-    df = df[["open", "high", "low", "close", "volume"]].copy()
-    return df
-
-
 def fetch_intraday_bars(symbol: str, start_date: date,
                         end_date: date) -> pd.DataFrame:
-    """
-    Fetch 1-min bars over a date range, converted to America/New_York tz.
-    Uses pagination to get all bars.
-    """
+    """Fetch 1-min bars over a date range, converted to America/New_York tz."""
     all_results = []
-    js = _get(
-        f"{BASE}/v2/aggs/ticker/{symbol}/range/1/minute/{start_date}/{end_date}",
+    js = gex_common.poly_get(
+        f"{gex_common._BASE}/v2/aggs/ticker/{symbol}/range/1/minute/{start_date}/{end_date}",
         {"adjusted": "true", "sort": "asc", "limit": 50000},
     )
     all_results.extend(js.get("results") or [])
-
-    # Paginate if there's a next_url
     while js.get("next_url"):
-        js = _get_next(js["next_url"])
+        js = gex_common.poly_next(js["next_url"])
         all_results.extend(js.get("results") or [])
 
     if not all_results:
@@ -351,84 +193,6 @@ def fetch_intraday_bars(symbol: str, start_date: date,
     df = df.set_index("t")
     df = df[["open", "high", "low", "close", "volume"]].copy()
     return df
-
-
-# --- 0DTE Expiry Helpers ---
-
-# Tickers with daily 0DTE expirations (Mon-Fri)
-DAILY_0DTE = {"SPY", "QQQ", "IWM"}
-# Tickers with Mon/Wed/Fri 0DTE only
-MWF_0DTE = {"TSLA", "NVDA", "AMZN", "META", "AAPL", "MSFT", "AVGO", "GOOGL", "IBIT"}
-
-
-def has_0dte_expiry(symbol: str, trade_date: date) -> bool:
-    """Check whether this symbol has a 0DTE expiration on the given date."""
-    dow = trade_date.weekday()  # 0=Mon, 4=Fri
-    if symbol in DAILY_0DTE:
-        return dow < 5  # Mon-Fri
-    if symbol in MWF_0DTE:
-        return dow in (0, 2, 4)  # Mon, Wed, Fri
-    return dow == 4  # Friday-only fallback
-
-
-def build_option_ticker(symbol: str, expiry: date, option_type: str, strike: float) -> str:
-    """
-    Build OCC-format option ticker for Polygon.
-    Example: O:SPY260227C00695000
-    option_type: "C" or "P"
-    """
-    exp_str = expiry.strftime("%y%m%d")
-    strike_int = int(strike * 1000)
-    return f"O:{symbol}{exp_str}{option_type}{strike_int:08d}"
-
-
-def fetch_option_price_at_time(
-    symbol: str,
-    expiry: date,
-    option_type: str,
-    strike: float,
-    signal_time: str,
-) -> Optional[float]:
-    """
-    Fetch real option price near signal_time using 5-min aggregate bars.
-    Returns the close of the 5-min candle whose timestamp <= signal_time,
-    or None if no data is available.
-    """
-    occ = build_option_ticker(symbol, expiry, option_type, strike)
-    date_str = expiry.isoformat()
-
-    try:
-        js = _get(
-            f"{BASE}/v2/aggs/ticker/{occ}/range/5/minute/{date_str}/{date_str}",
-            {"adjusted": "true", "sort": "asc", "limit": 5000},
-        )
-    except RuntimeError:
-        return None
-
-    results = js.get("results") or []
-    if not results:
-        return None
-
-    # Parse signal_time to epoch ms for comparison
-    # signal_time format: "2026-02-27 09:45:00-05:00" (tz-aware string)
-    try:
-        sig_dt = pd.Timestamp(signal_time)
-        sig_epoch_ms = int(sig_dt.timestamp() * 1000)
-    except Exception:
-        return None
-
-    # Find the latest candle with timestamp <= signal_time
-    best = None
-    for bar in results:
-        t = bar.get("t", 0)
-        if t <= sig_epoch_ms:
-            best = bar
-        else:
-            break  # bars are sorted ascending
-
-    if best is not None and best.get("c") is not None:
-        return float(best["c"])
-    return None
 
 
 # ============================================================================
@@ -513,26 +277,6 @@ class WallSignal:
     signal_time: str          # timestamp of the signal bar
 
 
-def compute_5min_atr(bars_5min: pd.DataFrame, periods: int = 14) -> pd.Series:
-    """
-    Standard ATR on 5-min bars using True Range.
-    TR = max(H-L, |H-prevC|, |L-prevC|)
-    ATR = rolling mean of TR over `periods` bars.
-    Returns Series aligned with bars_5min index.
-    """
-    high = bars_5min["high"]
-    low = bars_5min["low"]
-    prev_close = bars_5min["close"].shift(1)
-
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr = tr.rolling(window=periods, min_periods=periods).mean()
-    return atr
-
-
 def detect_momentum_signal(
     symbol: str,
     trade_date: date,
@@ -557,7 +301,7 @@ def detect_momentum_signal(
         return None
 
     # Compute ATR on all available 5-min bars (includes prior days)
-    atr = compute_5min_atr(bars_5min, periods=cfg.atr_lookback_periods)
+    atr = gex_common.compute_atr(bars_5min, periods=cfg.atr_lookback_periods)
 
     # Filter to current day's scan window
     day_bars = bars_5min[bars_5min.index.date == trade_date]
@@ -682,11 +426,11 @@ def simulate_credit_spread(
     used_real = False
 
     if expiry is not None:
-        short_price = fetch_option_price_at_time(
+        short_price = gex_common.fetch_option_price(
             signal.symbol, expiry, option_type, short_strike, signal.signal_time,
         )
         time.sleep(0.25)  # rate-limit: 2 calls per trade
-        long_price = fetch_option_price_at_time(
+        long_price = gex_common.fetch_option_price(
             signal.symbol, expiry, option_type, long_strike, signal.signal_time,
         )
 
@@ -779,7 +523,7 @@ def run_backtest(cfg: BacktestConfig) -> Tuple[pd.DataFrame, Dict]:
         print(f"  Step 3: Fetching 5-min bars...")
         intraday_start = daily_bars.index[0] - timedelta(days=cfg.atr_lookback_days + 3)
         intraday_end = daily_bars.index[-1] + timedelta(days=1)
-        bars_5min = fetch_5min_bars(symbol, intraday_start, intraday_end)
+        bars_5min = gex_common.fetch_5min_bars(symbol, intraday_start, intraday_end)
         if bars_5min.empty:
             print(f"  WARNING: No 5-min bars for {symbol}")
             continue
@@ -804,7 +548,7 @@ def run_backtest(cfg: BacktestConfig) -> Tuple[pd.DataFrame, Dict]:
             trade_date = day_row["date"]
 
             # Skip days without 0DTE for this symbol
-            if not has_0dte_expiry(symbol, trade_date):
+            if not gex_common.has_0dte(symbol, trade_date):
                 skipped_no_0dte += 1
                 continue
 

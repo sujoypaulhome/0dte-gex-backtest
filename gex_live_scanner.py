@@ -31,6 +31,8 @@ import pandas as pd
 import requests as req
 from dotenv import load_dotenv
 
+import gex_common
+
 # ============================================================================
 # Config
 # ============================================================================
@@ -44,6 +46,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "skp-gamma-alerts")
 
 if not POLYGON_KEY:
     sys.exit("ERROR: Set POLYGON_API_KEY in .env")
+
+gex_common.init(POLYGON_KEY)
 
 # File logging — all print output goes to scanner.log + console
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scanner.log")
@@ -64,15 +68,7 @@ def print(*args, **kwargs):
     msg = " ".join(str(a) for a in args)
     _log.info(msg)
 
-POLYGON_BASE = "https://api.polygon.io"
 ET = ZoneInfo("America/New_York")
-
-# Core tickers (always scanned, profitable in backtest)
-CORE_TICKERS = ["QQQ", "IWM", "TSLA", "NVDA", "AMZN"]
-
-# 0DTE schedules
-DAILY_0DTE = {"SPY", "QQQ", "IWM"}
-MWF_0DTE = {"TSLA", "NVDA", "AMZN", "META", "AAPL", "MSFT", "AVGO", "GOOGL", "IBIT"}
 
 # Spread widths
 SPREAD_WIDTHS = {
@@ -95,54 +91,6 @@ MULTIPLIER = 100
 # Max dynamic tickers to add from IV scan
 MAX_DYNAMIC_TICKERS = 5
 MIN_OPTION_VOLUME = 1000
-
-
-# ============================================================================
-# Polygon HTTP helpers (with 429 retry)
-# ============================================================================
-
-def _poly_get(url: str, params: Dict = None) -> Dict:
-    if params is None:
-        params = {}
-    params["apiKey"] = POLYGON_KEY
-    last = None
-    for attempt in range(5):
-        r = req.get(url, params=params, timeout=30)
-        last = r
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                pass
-        if r.status_code == 429:
-            wait = 15 * (attempt + 1)
-            print(f"    Rate limited, waiting {wait}s...")
-            time.sleep(wait)
-        else:
-            time.sleep(1)
-    raise RuntimeError(f"Polygon GET failed {last.status_code}: {last.text[:200]}")
-
-
-def _poly_next(next_url: str) -> Dict:
-    if "apiKey=" not in next_url:
-        sep = "&" if "?" in next_url else "?"
-        next_url = f"{next_url}{sep}apiKey={POLYGON_KEY}"
-    last = None
-    for attempt in range(5):
-        r = req.get(next_url, timeout=30)
-        last = r
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                pass
-        if r.status_code == 429:
-            wait = 15 * (attempt + 1)
-            print(f"    Rate limited, waiting {wait}s...")
-            time.sleep(wait)
-            continue
-        time.sleep(1)
-    raise RuntimeError(f"Polygon NEXT failed {last.status_code}: {last.text[:200]}")
 
 
 # ============================================================================
@@ -304,21 +252,10 @@ def barchart_fetch_iv_rank(symbols: List[str]) -> List[Dict]:
     return results
 
 
-def has_0dte_today(symbol: str) -> bool:
-    """Check if symbol has 0DTE expiration today."""
-    dow = date.today().weekday()
-    if symbol in DAILY_0DTE:
-        return dow < 5
-    if symbol in MWF_0DTE:
-        return dow in (0, 2, 4)
-    return dow == 4  # Friday only
-
-
 def build_scan_list() -> List[str]:
     """Build today's scan list: core tickers filtered by 0DTE schedule."""
-    # All candidate tickers (core + MWF)
-    all_tickers = list(DAILY_0DTE | MWF_0DTE)
-    return [t for t in all_tickers if has_0dte_today(t)]
+    all_tickers = list(gex_common.DAILY_0DTE | gex_common.MWF_0DTE)
+    return [t for t in all_tickers if gex_common.has_0dte(t)]
 
 
 def send_iv_rank_notification(scan_list: List[str], iv_data: List[Dict]):
@@ -339,201 +276,6 @@ def send_iv_rank_notification(scan_list: List[str], iv_data: List[Dict]):
               tags="bar_chart")
 
 
-# ============================================================================
-# Phase 2: GEX Wall Detection (Polygon)
-# ============================================================================
-
-def get_underlying_price(symbol: str) -> Optional[float]:
-    """Fetch latest underlying price from Polygon."""
-    try:
-        js = _poly_get(f"{POLYGON_BASE}/v3/trades/{symbol}",
-                       {"limit": 1, "sort": "timestamp", "order": "desc"})
-        res = js.get("results") or []
-        if res:
-            px = res[0].get("price") or res[0].get("p")
-            if px is not None and np.isfinite(float(px)):
-                return float(px)
-    except Exception:
-        pass
-    try:
-        js = _poly_get(
-            f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
-        tkr = js.get("ticker") or {}
-        p = ((tkr.get("lastTrade") or {}).get("p")
-             or (tkr.get("day") or {}).get("c")
-             or (tkr.get("prevDay") or {}).get("c"))
-        if p is not None and np.isfinite(float(p)):
-            return float(p)
-    except Exception:
-        pass
-    try:
-        js = _poly_get(f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/prev")
-        res = js.get("results") or []
-        if res and res[0].get("c") is not None:
-            return float(res[0]["c"])
-    except Exception:
-        pass
-    return None
-
-
-def nearest_expiration(symbol: str) -> Optional[str]:
-    """Find nearest 0DTE (or closest) expiration."""
-    today = date.today()
-    params = {
-        "underlying_ticker": symbol,
-        "expired": "false",
-        "order": "asc",
-        "sort": "expiration_date",
-        "limit": 1000,
-    }
-    data = _poly_get(f"{POLYGON_BASE}/v3/reference/options/contracts", params)
-    exps = set()
-    while True:
-        for it in data.get("results", []) or []:
-            exp = it.get("expiration_date")
-            if exp:
-                exps.add(exp)
-        nxt = data.get("next_url")
-        if not nxt:
-            break
-        data = _poly_next(nxt)
-
-    if not exps:
-        return None
-
-    # Prefer 0DTE (today)
-    today_str = today.isoformat()
-    if today_str in exps:
-        return today_str
-
-    # Nearest within 0-7 DTE
-    candidates = []
-    for e in sorted(exps):
-        dte = (date.fromisoformat(e) - today).days
-        if 0 <= dte <= 7:
-            candidates.append((dte, e))
-    if candidates:
-        candidates.sort()
-        return candidates[0][1]
-    return None
-
-
-def fetch_gex_walls(symbol: str) -> Optional[Dict]:
-    """
-    Fetch GEX walls: call_wall, next_call_wall, put_wall, next_put_wall, spot.
-    Returns dict or None on failure.
-    """
-    exp = nearest_expiration(symbol)
-    if not exp:
-        print(f"    [{symbol}] No expiration found")
-        return None
-
-    # Fetch option chain snapshot
-    params = {
-        "expiration_date": exp,
-        "order": "asc",
-        "sort": "strike_price",
-        "limit": 250,
-    }
-    data = _poly_get(f"{POLYGON_BASE}/v3/snapshot/options/{symbol}", params)
-    contracts = []
-
-    def parse_batch(js):
-        for res in js.get("results", []) or []:
-            details = res.get("details", {}) or {}
-            typ = (details.get("contract_type")
-                   or res.get("contract_type") or "").lower()
-            strike = details.get("strike_price") or res.get("strike_price")
-            oi = res.get("open_interest")
-            if typ in ("call", "put") and strike is not None:
-                contracts.append({
-                    "strike": float(strike),
-                    "type": typ,
-                    "oi": float(oi) if oi is not None else 0.0,
-                })
-
-    parse_batch(data)
-    while data.get("next_url"):
-        data = _poly_next(data["next_url"])
-        parse_batch(data)
-
-    if not contracts:
-        print(f"    [{symbol}] No option contracts found")
-        return None
-
-    df = pd.DataFrame(contracts)
-    calls = df[df["type"] == "call"].sort_values("oi", ascending=False)
-    puts = df[df["type"] == "put"].sort_values("oi", ascending=False)
-
-    spot = get_underlying_price(symbol)
-    if spot is None:
-        print(f"    [{symbol}] Could not get underlying price")
-        return None
-
-    result = {"spot": spot, "expiry": exp}
-
-    if not calls.empty:
-        result["call_wall"] = float(calls.iloc[0]["strike"])
-        result["next_call_wall"] = float(calls.iloc[1]["strike"]) if len(calls) > 1 else result["call_wall"]
-    else:
-        result["call_wall"] = spot * 1.02
-        result["next_call_wall"] = spot * 1.04
-
-    if not puts.empty:
-        result["put_wall"] = float(puts.iloc[0]["strike"])
-        result["next_put_wall"] = float(puts.iloc[1]["strike"]) if len(puts) > 1 else result["put_wall"]
-    else:
-        result["put_wall"] = spot * 0.98
-        result["next_put_wall"] = spot * 0.96
-
-    print(f"    [{symbol}] CW={result['call_wall']:.0f} "
-          f"(next={result['next_call_wall']:.0f}) | "
-          f"PW={result['put_wall']:.0f} "
-          f"(next={result['next_put_wall']:.0f}) | "
-          f"Spot={spot:.2f} | Exp={exp}")
-    return result
-
-
-# ============================================================================
-# Phase 3: 5-Min Bars + ATR
-# ============================================================================
-
-def fetch_5min_bars(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """Fetch 5-min bars from Polygon, converted to ET."""
-    all_results = []
-    js = _poly_get(
-        f"{POLYGON_BASE}/v2/aggs/ticker/{symbol}/range/5/minute/{start_date}/{end_date}",
-        {"adjusted": "true", "sort": "asc", "limit": 50000},
-    )
-    all_results.extend(js.get("results") or [])
-    while js.get("next_url"):
-        js = _poly_next(js["next_url"])
-        all_results.extend(js.get("results") or [])
-
-    if not all_results:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_results)
-    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df["t"] = df["t"].dt.tz_convert("America/New_York")
-    df = df.rename(columns={"o": "open", "h": "high", "l": "low",
-                             "c": "close", "v": "volume"})
-    df = df.set_index("t")
-    df = df[["open", "high", "low", "close", "volume"]].copy()
-    return df
-
-
-def compute_atr(bars: pd.DataFrame, periods: int = ATR_PERIODS) -> pd.Series:
-    """ATR(14) on 5-min bars using True Range."""
-    high = bars["high"]
-    low = bars["low"]
-    prev_close = bars["close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(window=periods, min_periods=periods).mean()
 
 
 # ============================================================================
@@ -591,52 +333,6 @@ def check_for_spike(
                 "candle_close": candle_close,
             }
 
-    return None
-
-
-# ============================================================================
-# Phase 5: Option Price Lookup + Alert
-# ============================================================================
-
-def build_occ_ticker(symbol: str, expiry: date, option_type: str,
-                     strike: float) -> str:
-    """Build OCC-format option ticker. option_type: 'C' or 'P'."""
-    exp_str = expiry.strftime("%y%m%d")
-    strike_int = int(strike * 1000)
-    return f"O:{symbol}{exp_str}{option_type}{strike_int:08d}"
-
-
-def fetch_option_price(symbol: str, expiry: date, option_type: str,
-                       strike: float, signal_time: str) -> Optional[float]:
-    """Fetch option price near signal_time from 5-min bars."""
-    occ = build_occ_ticker(symbol, expiry, option_type, strike)
-    date_str = expiry.isoformat()
-    try:
-        js = _poly_get(
-            f"{POLYGON_BASE}/v2/aggs/ticker/{occ}/range/5/minute/{date_str}/{date_str}",
-            {"adjusted": "true", "sort": "asc", "limit": 5000},
-        )
-    except RuntimeError:
-        return None
-
-    results = js.get("results") or []
-    if not results:
-        return None
-
-    try:
-        sig_epoch_ms = int(pd.Timestamp(signal_time).timestamp() * 1000)
-    except Exception:
-        return None
-
-    best = None
-    for bar in results:
-        if bar.get("t", 0) <= sig_epoch_ms:
-            best = bar
-        else:
-            break
-
-    if best and best.get("c") is not None:
-        return float(best["c"])
     return None
 
 
@@ -824,7 +520,7 @@ def main():
     walls_map: Dict[str, Dict] = {}
     for symbol in scan_list:
         try:
-            walls = fetch_gex_walls(symbol)
+            walls = gex_common.fetch_gex_walls(symbol)
             if walls:
                 walls_map[symbol] = walls
         except Exception as e:
@@ -841,7 +537,7 @@ def main():
 
     for symbol in walls_map:
         try:
-            bars = fetch_5min_bars(symbol, start_date, today)
+            bars = gex_common.fetch_5min_bars(symbol, start_date, today)
             if not bars.empty:
                 bars_map[symbol] = bars
                 print(f"    [{symbol}] {len(bars)} bars")
@@ -884,14 +580,14 @@ def main():
         for symbol in active:
             try:
                 # Refresh today's bars
-                new_bars = fetch_5min_bars(symbol, today, today)
+                new_bars = gex_common.fetch_5min_bars(symbol, today, today)
                 if not new_bars.empty:
                     existing = bars_map[symbol]
                     combined = pd.concat([existing, new_bars])
                     bars_map[symbol] = combined[~combined.index.duplicated(keep="last")]
 
                 # Compute ATR
-                atr = compute_atr(bars_map[symbol])
+                atr = gex_common.compute_atr(bars_map[symbol])
 
                 # Check for spike
                 spike = check_for_spike(symbol, bars_map[symbol], atr, today)
@@ -914,11 +610,11 @@ def main():
                         short_strike = walls["put_wall"]
                         long_strike = short_strike - width
 
-                    short_px = fetch_option_price(
+                    short_px = gex_common.fetch_option_price(
                         symbol, expiry, opt_type, short_strike,
                         spike["signal_time"])
                     time.sleep(0.25)
-                    long_px = fetch_option_price(
+                    long_px = gex_common.fetch_option_price(
                         symbol, expiry, opt_type, long_strike,
                         spike["signal_time"])
 
